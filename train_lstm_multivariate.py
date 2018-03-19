@@ -17,9 +17,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from os import path
-
+import os
 import numpy
+import pprint
 import tensorflow as tf
 
 from tensorflow.contrib.timeseries.python.timeseries import estimators as ts_estimators
@@ -42,11 +42,13 @@ class _LSTMModel(ts_model.SequentialTimeSeriesModel):
       dtype: The floating point data type to use.
     """
     super(_LSTMModel, self).__init__(
-        # Pre-register the metrics we'll be outputting (just a mean here).
-        train_output_names=["mean"],
-        predict_output_names=["mean"],
-        num_features=num_features,
-        dtype=dtype)
+      # Pre-register the metrics we'll be outputting (just a mean here).
+      train_output_names=["mean"],
+      predict_output_names=["mean"],
+      num_features=num_features,
+      dtype=dtype
+    )
+
     self._num_units = num_units
     # Filled in by initialize_graph()
     self._lstm_cell = None
@@ -65,27 +67,32 @@ class _LSTMModel(ts_model.SequentialTimeSeriesModel):
     self._lstm_cell = tf.nn.rnn_cell.LSTMCell(num_units=self._num_units)
     # Create templates so we don't have to worry about variable reuse.
     self._lstm_cell_run = tf.make_template(
-        name_="lstm_cell",
-        func_=self._lstm_cell,
-        create_scope_now_=True)
+      name_="lstm_cell",
+      func_=self._lstm_cell,
+      create_scope_now_=True
+    )
     # Transforms LSTM output into mean predictions.
     self._predict_from_lstm_output = tf.make_template(
-        name_="predict_from_lstm_output",
-        func_=lambda inputs: tf.layers.dense(inputs=inputs, units=self.num_features),
-        create_scope_now_=True)
+      name_="predict_from_lstm_output",
+      func_=lambda inputs: tf.layers.dense(inputs=inputs, units=self.num_features),
+      create_scope_now_=True
+    )
 
   def get_start_state(self):
     """Return initial state for the time series model."""
     return (
-        # Keeps track of the time associated with this state for error checking.
-        tf.zeros([], dtype=tf.int64),
-        # The previous observation or prediction.
-        tf.zeros([self.num_features], dtype=self.dtype),
-        # The state of the RNNCell (batch dimension removed since this parent
-        # class will broadcast).
-        [tf.squeeze(state_element, axis=0)
-         for state_element
-         in self._lstm_cell.zero_state(batch_size=1, dtype=self.dtype)])
+      # Keeps track of the time associated with this state for error checking.
+      tf.zeros([], dtype=tf.int64),
+      # The previous observation or prediction.
+      tf.zeros([self.num_features], dtype=self.dtype),
+      # The state of the RNNCell (batch dimension removed since this parent
+      # class will broadcast).
+      [
+        tf.squeeze(state_element, axis=0)
+        for state_element
+        in self._lstm_cell.zero_state(batch_size=1, dtype=self.dtype)
+      ]
+    )
 
   def _transform(self, data):
     """Normalize data based on input statistics to encourage stable training."""
@@ -117,12 +124,10 @@ class _LSTMModel(ts_model.SequentialTimeSeriesModel):
       although only "loss" will be optimized).
     """
     state_from_time, prediction, lstm_state = state
-    with tf.control_dependencies(
-            [tf.assert_equal(current_times, state_from_time)]):
+    with tf.control_dependencies([tf.assert_equal(current_times, state_from_time)]):
       transformed_values = self._transform(current_values)
       # Use mean squared error across features for the loss.
-      predictions["loss"] = tf.reduce_mean(
-          (prediction - transformed_values) ** 2, axis=-1)
+      predictions["loss"] = tf.reduce_mean((prediction - transformed_values) ** 2, axis=-1)
       # Keep track of the new observation in model state. It won't be run
       # through the LSTM until the next _imputation_step.
       new_state_tuple = (current_times, transformed_values, lstm_state)
@@ -144,34 +149,50 @@ class _LSTMModel(ts_model.SequentialTimeSeriesModel):
     # depends on the gap size.
     return state
 
-  def _exogenous_input_step(
-          self, current_times, current_exogenous_regressors, state):
+  def _exogenous_input_step(self, current_times, current_exogenous_regressors, state):
     """Update model state based on exogenous regressors."""
-    raise NotImplementedError(
-        "Exogenous inputs are not implemented for this example.")
+    raise NotImplementedError("Exogenous inputs are not implemented for this example.")
 
 
 if __name__ == '__main__':
   tf.logging.set_verbosity(tf.logging.INFO)
-  csv_file_name = path.join("./data/multivariate_periods.csv")
+
+  # 1. Read from .csv file 
   reader = tf.contrib.timeseries.CSVReader(
-      csv_file_name,
-      column_names=((tf.contrib.timeseries.TrainEvalFeatures.TIMES,)
-                    + (tf.contrib.timeseries.TrainEvalFeatures.VALUES,) * 5))
+    "./data/multivariate_periods.csv",
+    column_names=(
+      (tf.contrib.timeseries.TrainEvalFeatures.TIMES,)
+      + (tf.contrib.timeseries.TrainEvalFeatures.VALUES,) * 5)
+    )
+
   train_input_fn = tf.contrib.timeseries.RandomWindowInputFn(
-      reader, batch_size=4, window_size=32)
+    reader, batch_size=4, window_size=32  # much smaller window_size produces flat lines.
+  )
 
+  # See: https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/estimator/estimator.py#L70
+  # See: https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/timeseries/python/timeseries/estimators.py#L41
   estimator = ts_estimators.TimeSeriesRegressor(
-      model=_LSTMModel(num_features=5, num_units=128),
-      optimizer=tf.train.AdamOptimizer(0.001))
+    model=_LSTMModel(num_features=5, num_units=128),
+    optimizer=tf.train.AdamOptimizer(0.001)   # Not much different than default: train.AdamOptimizer(0.02)
+  )
 
+  # See: https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/estimator/estimator.py#L288
   estimator.train(input_fn=train_input_fn, steps=200)
+
+  # See: https://www.tensorflow.org/api_docs/python/tf/contrib/timeseries/WholeDatasetInputFn
+  # Q: Why are we evaluating using the same data as the training data? Can we pass data from different time ranges?
   evaluation_input_fn = tf.contrib.timeseries.WholeDatasetInputFn(reader)
+
+  # See: https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/estimator/estimator.py#L366
   evaluation = estimator.evaluate(input_fn=evaluation_input_fn, steps=1)
-  # Predict starting after the evaluation
+
+  # Predict after the evaluation
+  # See: https://www.tensorflow.org/api_docs/python/tf/contrib/timeseries/predict_continuation_input_fn
+  # See: https://github.com/tensorflow/tensorflow/blob/f0a965f268c0527704469d9c9a68acb9a1647afa/tensorflow/contrib/timeseries/python/timeseries/input_pipeline.py#L101
+  # See: https://github.com/tensorflow/tensorflow/blob/master/tensorflow/python/estimator/estimator.py#L428
   (predictions,) = tuple(estimator.predict(
-      input_fn=tf.contrib.timeseries.predict_continuation_input_fn(
-          evaluation, steps=100)))
+    input_fn=tf.contrib.timeseries.predict_continuation_input_fn(evaluation, steps=100)
+  ))
 
   observed_times = evaluation["times"][0]
   observed = evaluation["observed"][0, :, :]
@@ -180,11 +201,15 @@ if __name__ == '__main__':
   predicted_times = predictions['times']
   predicted = predictions["mean"]
 
+  print("-----------")
+  print("PREDICTIONS")
+  print("-----------")
+  pprint.PrettyPrinter(indent=4).pprint(predictions)
+
   plt.figure(figsize=(15, 5))
   plt.axvline(99, linestyle="dotted", linewidth=4, color='r')
   observed_lines = plt.plot(observed_times, observed, label="observation", color="k")
   evaluated_lines = plt.plot(evaluated_times, evaluated, label="evaluation", color="g")
   predicted_lines = plt.plot(predicted_times, predicted, label="prediction", color="r")
-  plt.legend(handles=[observed_lines[0], evaluated_lines[0], predicted_lines[0]],
-             loc="upper left")
-  plt.savefig('predict_result.jpg')
+  plt.legend(handles=[observed_lines[0], evaluated_lines[0], predicted_lines[0]], loc="upper left")
+  plt.savefig('predict_result.png')
